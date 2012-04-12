@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <errno.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include "queue.h"
 
 typedef struct queue {
@@ -75,10 +77,55 @@ void queue_push(QUEUE *q, void *val){
 }
 
 void* queue_pop(QUEUE *q){
+  return (void*) queue_pop_timedwait(q, -1, -1);
+}
+
+void* queue_pop_no_wait(QUEUE *q){
   pthread_mutex_lock(&(q->mutex));
-  while (q->current_size == 0){
-    pthread_cond_wait(&(q->can_pop), &(q->mutex));
+  if (q->current_size == 0){
+    pthread_mutex_unlock(&(q->mutex));
+    return NULL;
   }
+
+  void *val = q->data[q->out];
+  q->current_size--;
+  q->out++;
+  q->out %= q->max_size;
+
+  pthread_mutex_unlock(&(q->mutex));
+  pthread_cond_broadcast(&(q->can_push));
+
+  return val;
+}
+
+void* queue_pop_timedwait(QUEUE *q, int wait_s, int wait_ns){
+  pthread_mutex_lock(&(q->mutex));
+
+  if (wait_ns > 0 || wait_s > 0){
+    struct timeval tv;
+    struct timespec ts;
+    gettimeofday(&tv, NULL);
+
+    if (wait_s > 0){
+      ts.tv_sec = tv.tv_sec + wait_s;
+    }
+    if (wait_ns > 0){
+      ts.tv_nsec = tv.tv_usec + wait_ns;
+    }
+    int retcode = 0;
+    while (q->current_size == 0 && retcode != ETIMEDOUT){
+      retcode = pthread_cond_timedwait(&(q->can_pop), &(q->mutex), &ts);
+    }
+    if (retcode == ETIMEDOUT){
+      pthread_mutex_unlock(&(q->mutex));
+      return NULL;
+    }
+  }else{
+    while (q->current_size == 0){
+      pthread_cond_wait(&(q->can_pop), &(q->mutex));
+   }
+  }
+
   void *val = q->data[q->out];
   q->current_size--;
   q->out++;

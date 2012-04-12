@@ -11,12 +11,14 @@ typedef struct tp {
   int pool_size;
   int stop;
   QUEUE* queue;
+  work_fn func;
 } threadpool;
 
 typedef struct tp_job {
   work_fn fn;
   void * arg;
 } tp_job;
+
 
 void* threadpool_worker(void* arg) {
   THREADPOOL* tp = (THREADPOOL*) arg;
@@ -50,6 +52,8 @@ THREADPOOL *threadpool_create(int num_threads, int max_queue_size) {
   //queue
   tp->queue = queue_create(max_queue_size);
 
+  // setup default worker.
+  tp->func = threadpool_worker;
   return tp;
 
 error:
@@ -64,20 +68,37 @@ void threadpool_destroy(THREADPOOL *tp){
   tp = NULL;
 }
 
+void threadpool_set_func(THREADPOOL *t, work_fn fn){
+  t->func = fn;
+}
 
-int threadpool_push(THREADPOOL *tp, work_fn fn, void *argument) {
+int threadpool_push1(THREADPOOL *tp, work_fn fn, void *argument) {
   tp_job *job = malloc(sizeof(*job));
   job->fn = fn;
   job->arg  = argument;
+  return threadpool_push(tp, job);
+}
 
-  queue_push(tp->queue, (void*) job);
+int threadpool_push(THREADPOOL *tp, void* job) {
+  queue_push(tp->queue, job);
   return 0;
 }
+void* threadpool_pop(THREADPOOL *tp){
+  return queue_pop(tp->queue);
+}
+
+void* threadpool_pop_timedwait(THREADPOOL *tp, int wait_s, int wait_ns){
+  return queue_pop_timedwait(tp->queue, wait_s, wait_ns);
+}
+void* threadpool_pop_no_wait(THREADPOOL *tp){
+  return queue_pop_no_wait(tp->queue);
+}
+
 
 void threadpool_start(THREADPOOL* tp){
   // make this account for restarts.
   for (int i = 0; i < tp->pool_size; i++){ 
-    pthread_create(&(tp->pool[i]), NULL, threadpool_worker, (void*) tp);
+    pthread_create(&(tp->pool[i]), NULL, tp->func, (void*) tp);
   }
 }
 
@@ -86,4 +107,8 @@ void threadpool_stop(THREADPOOL* t){
   t->stop = 1;
 }
 
+
+bool threadpool_stopped(THREADPOOL* t){
+  return t->stop == 1;
+}
 
