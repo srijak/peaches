@@ -11,73 +11,95 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <fcntl.h>
-#include <pthread.h>
+#include <string.h>
 
-pthread_mutex_t fd_mutex;
+int* pipe_fds;
 
-typedef struct readjob {
-  fd_set* actives;
-  int current_fd;
-} readjob;
-
-void setclr_bit(int b, fd_set* s, bool set){
-  if (b > FD_SETSIZE){
-    printf("Error: fd[%d] is greater than FD_SETSIZE[%d]\n", b, FD_SETSIZE);
-  }
-  pthread_mutex_lock(&fd_mutex);
-  if (set){
-    FD_SET(b, s);
-  }else{
-    FD_CLR(b, s);
-  }
-  pthread_mutex_unlock(&fd_mutex);
-}
-
-int read_from(readjob* j)
-{
+int read_from(int filedes) {
   char buffer[1024];
   int nbytes;
 
-  nbytes = read (j->current_fd, buffer, 1024);
-  if (nbytes == 0){
-    return 0;
-  }if (nbytes < 0){
-    printf("Read error with [%d]\n", j->current_fd);
-    // FD_* actions probably need mutex.
-    setclr_bit(j->current_fd, j->actives, false);
-    close(j->current_fd);
-    return -1;
+  nbytes = read (filedes, buffer, 1024);
+  if (nbytes > 0){
+    printf ("Server: got message: `%s'\n", buffer);
+    write(filedes, buffer, nbytes);
   }
-//  printf ("Server: got message: `%s'\n", buffer);
-  write(j->current_fd, buffer, nbytes);
   return nbytes;
+}
+
+int setup_pipe(int* pdfs){
+  if (pipe(pdfs) == -1){
+    goto error;
+  }
+
+  int flags = 0;
+  for (int i = 0; i < 2; i++){
+    if ((flags = fcntl(pdfs[i], F_GETFL)) == -1){
+      goto error;
+    }
+    flags |= O_NONBLOCK;
+    if ((flags = fcntl(pdfs[i], F_SETFL)) == -1){
+      goto error;
+    }
+  }
+  return 0;
+
+error:
+  printf("Error setting up pipe: %s\n", strerror(errno));
+  return -1;
 }
 
 
 void *worker(void* arg){
   THREADPOOL* tp = (THREADPOOL*) arg;
+  fd_set active, read_only;
+  FD_ZERO(&active);
+  FD_SET(pipe_fds[0], &active);
+
   while (!threadpool_stopped(tp)){
-    readjob* job = threadpool_pop(tp);
-    if (job != NULL){
-      printf("fd[%d] is ready for reading.\n", job->current_fd);
-      read_from(job) ;
+    read_only = active;
 
-    }
+    int ret= select (FD_SETSIZE, &read_only, NULL, NULL, NULL);
+    switch (ret) {
+       case -1:
+        break;
+      default:
+        if (FD_ISSET(pipe_fds[0], &read_only)){
+          // look into using just a pipe as queue.
 
-    free(job);
-    job = NULL;
-  }
+          // read pipe to flush out the notifications. 
+          char ch;
+          read(pipe_fds[0], &ch, 10);
+          // try to get a job from queue and process.
+          int* job = threadpool_pop_no_wait(tp);
+          if (job != NULL){
+            if (*job >= FD_SETSIZE){
+              printf("Error: got fd[%d] greater than FD_SETSIZE[%d]. Ignoring.\n", *job, FD_SETSIZE);
+            }else{
+              FD_SET(*job, &active);
+            }
+            free(job);
+            job = NULL;
+          }
+        }
+        for (int i = 0; i < FD_SETSIZE; i++){
+          if (i == pipe_fds[0]){
+            continue;
+          }
+          if (FD_ISSET(i, &read_only)){
+            if (read_from(i) <= 0){
+              printf("Disconnecting %d\n", i); 
+              FD_CLR(i, &active);
+              close(i);
+            }
+          }
+        }
+        break;
+    } 
+ }
   return 0;
 }
 
-
-int set_nonblock(int fd) {
-  int flags;
-  if ((flags = fcntl(fd, F_GETFL, 0)) == -1){
-    flags = 0;
-  }
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
 
 int tcp_server(int port)
 {
@@ -86,7 +108,6 @@ int tcp_server(int port)
   if (sock < 0) {
     goto error;
   }
-  set_nonblock(sock);
   // set SO_REUSEADDR
   int reuse_addr = 1;
   if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) == -1){
@@ -106,7 +127,7 @@ int tcp_server(int port)
   }
 
   // Listen
-  if (listen(sock, 128) == -1){
+  if (listen(sock, 127) == -1){
     printf("Error: listen error: %d\n", errno);
     goto error;
   }
@@ -120,17 +141,33 @@ error:
   return -1;
 }
 
-void eventloop(int serv, fd_set* active_fds, THREADPOOL* tp){
-  fd_set read_fds;
-  while(1){
-    pthread_mutex_lock(&fd_mutex);
-    read_fds = *active_fds;
-    pthread_mutex_unlock(&fd_mutex);
+int main(){
+  pipe_fds = malloc(2*sizeof(int)); 
+  setup_pipe(pipe_fds);
 
-    printf("waiting for connect in main.\n");
- 
-    int retval = select(FD_SETSIZE, &read_fds, NULL, NULL, NULL) ;
-    if (retval > 0){
+  int port = 7878;
+  int threads = 8;
+  int queue_size = 10000;
+  THREADPOOL* tp = threadpool_create(threads, queue_size);
+  threadpool_set_func(tp, worker);
+  threadpool_start(tp);
+
+  int serv= tcp_server(port);
+  fd_set read_fds, active_fds;
+  FD_ZERO(&active_fds);
+
+
+  FD_SET(serv, &active_fds);
+
+  printf("Serving on %d\n", port);
+  while(1){
+    read_fds = active_fds;
+
+    int sel = select(FD_SETSIZE, &read_fds, NULL, NULL, NULL);
+    switch (sel){
+      case -1:
+        break;
+      default:
         for (int i = 0; i < FD_SETSIZE; i++){
           if (FD_ISSET(i, &read_fds)){
             if (i == serv){
@@ -139,45 +176,21 @@ void eventloop(int serv, fd_set* active_fds, THREADPOOL* tp){
               socklen_t size = sizeof(client);
               int client_fd = accept(serv, (struct sockaddr *) &client, &size);
               if (client_fd < 0){
-                printf("Error: error accepting\n");
-              }else{
-                setclr_bit(client_fd, active_fds, true);
+                printf("Error: error accepting. %s\n", strerror(errno));
+              }
+              int *p = malloc(sizeof(*p));
+              *p = client_fd;
+              threadpool_push(tp,  (void*)p);
+              // let threads know there is a new item for consumption
+              if (write(pipe_fds[1], "r", 1) == -1 && errno != EAGAIN){
+                printf("Error: couldn't write to pipe fd: %d.   %s\n", pipe_fds[1], strerror(errno));
               }
             }else{
-              printf("Got input from fd[%d]. Push off to threadpool.\n", i);
-              readjob* job = malloc(sizeof(*job));
-              job->actives = active_fds;
-              job->current_fd = i;
-              threadpool_push(tp, (void*) job);
+              printf("Got input from fd[%d]. We only shoudl be listening for server fd[%d]\n", i, serv);
             }
           }
         }
-    }else{
-      printf("Select retval: %d.   errno: %d\n", retval, errno);
-      perror(errno);
+        break;
     }
   }
-}
-
-int main(){
-  int port = 7878;
-  int threads = 10;
-  int queue_size = 5000;
-  if ((pthread_mutex_init(&fd_mutex, NULL)) != 0){
-    printf("Error: couldnt initialize fd_mutex.\n");
-    exit(1);
-  }
-
-  THREADPOOL* tp = threadpool_create(threads, queue_size);
-
-  threadpool_set_func(tp, worker);
-
-  threadpool_start(tp);
-
-  int serv= tcp_server(port);
-
-  fd_set* active_fds = malloc(sizeof(fd_set));
-  FD_ZERO(active_fds);
-  setclr_bit(serv, active_fds, true); 
-  eventloop(serv, active_fds, tp);
 }
